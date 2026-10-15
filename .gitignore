@@ -1,0 +1,10 @@
+# Never commit personal job-search data
+jobs.json
+jobs.html
+*.pdf
+FORM_ANSWERS.md
+INTERVIEW_PREP.md
+score.json
+jd*.txt
+*profile*.yaml
+__pycache__/

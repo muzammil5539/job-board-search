@@ -1,0 +1,13 @@
+# <ats>:<slug>   one per line. Dead slugs are skipped and reported by `jobs.py search`.
+# Find a slug from a careers URL: jobs.lever.co/<slug> | jobs.ashbyhq.com/<slug> | boards.greenhouse.io/<slug>
+lever:ro
+lever:matchgroup
+ashby:ramp
+ashby:openai
+ashby:linear
+ashby:deel
+ashby:vanta
+greenhouse:stripe
+greenhouse:airbnb
+greenhouse:databricks
+greenhouse:robinhood
