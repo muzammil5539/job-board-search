@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Job board search + ATS scoring + form-answer sheet. One driver, five subcommands.
+"""Job board search + ATS scoring + form-answer sheet. One driver, six subcommands.
 
+  companies resolve a company name or careers URL to an <ats>:<slug> board
   search   fetch Lever/Ashby/Greenhouse/WorkingNomads/RemoteOK -> jobs.json + jobs.html
   dork     build Google site: queries per board, optionally open them in Chrome
   score    heuristic ATS score of a resume against a job description
@@ -9,7 +10,7 @@
 
 ponytail: no framework, no DB, no async. requests + stdlib. Files on disk are the state.
 """
-import argparse, html, json, os, re, subprocess, sys, urllib.parse
+import argparse, html, json, os, re, subprocess, sys, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -18,11 +19,22 @@ import requests
 HERE = os.path.dirname(os.path.abspath(__file__))
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) job-board-search/1.0"}
 TIMEOUT = 25
+RETRIES = 3
+BACKOFF = 1.5  # seconds, doubled per attempt
 
 # ---------------------------------------------------------------- fetchers
 
 def _get(url, **kw):
-    r = requests.get(url, headers=UA, timeout=TIMEOUT, **kw)
+    """GET with bounded retry. Boards 429 under the 8-way fan-out; a bare get
+    turns a throttle into a permanently 'dead' source in the run report."""
+    for attempt in range(RETRIES):
+        r = requests.get(url, headers=UA, timeout=TIMEOUT, **kw)
+        if r.status_code in (429, 502, 503, 504) and attempt < RETRIES - 1:
+            wait = float(r.headers.get("Retry-After") or BACKOFF * (2 ** attempt))
+            time.sleep(min(wait, 30))
+            continue
+        r.raise_for_status()
+        return r
     r.raise_for_status()
     return r
 
@@ -94,14 +106,25 @@ GLOBAL = {"workingnomads": fetch_workingnomads, "remoteok": fetch_remoteok}
 
 
 def load_companies(path):
-    out = []
-    for line in open(path):
-        line = line.split("#")[0].strip()
-        if ":" in line:
-            ats, slug = line.split(":", 1)
-            if ats in ATS:
-                out.append((ats, slug))
-    return out
+    """Returns (pairs, problems). A silently-dropped typo is indistinguishable
+    from a company you forgot to add, so bad lines are returned, not swallowed."""
+    out, problems = [], []
+    for n, raw in enumerate(open(path), 1):
+        line = raw.split("#")[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            problems.append(f"{path}:{n}: missing ':' -> {line!r}")
+            continue
+        ats, slug = line.split(":", 1)
+        ats, slug = ats.strip(), slug.strip()
+        if ats not in ATS:
+            problems.append(f"{path}:{n}: unknown ATS {ats!r} (want {'/'.join(ATS)}) -> {line!r}")
+        elif not slug:
+            problems.append(f"{path}:{n}: empty slug -> {line!r}")
+        else:
+            out.append((ats, slug))
+    return out, problems
 
 # ---------------------------------------------------------------- search
 
@@ -123,9 +146,24 @@ def matches(job, kws, locs, exclude):
     return True
 
 
+ALL_SOURCES = sorted(set(ATS) | set(GLOBAL))
+
+
 def cmd_search(a):
+    bad = [o for o in (a.only or []) if o not in ALL_SOURCES]
+    if bad:
+        sys.exit(f"unknown source(s): {', '.join(bad)}\n"
+                 f"valid: {', '.join(ALL_SOURCES)}\n"
+                 f"(LinkedIn, Indeed and FlexJobs are not supported - see SKILL.md)")
+
+    pairs, problems = load_companies(a.companies)
+    for prob in problems:
+        print(f"  WARN {prob}", file=sys.stderr)
+    if not pairs and not any(n in (a.only or ALL_SOURCES) for n in GLOBAL):
+        sys.exit(f"no usable sources: {a.companies} yielded no valid entries")
+
     tasks = [(n, f, None) for n, f in GLOBAL.items() if not a.only or n in a.only]
-    for ats, slug in load_companies(a.companies):
+    for ats, slug in pairs:
         if not a.only or ats in a.only:
             tasks.append((f"{ats}:{slug}", ATS[ats], slug))
 
@@ -151,19 +189,27 @@ def cmd_search(a):
     hits = [j for j in jobs
             if matches(j, [_rx(k) for k in kws], [_rx(l) for l in locs], [_rx(x) for x in exc])]
 
+    # Location is part of the key on purpose: Stripe lists one title in US-CA
+    # and Singapore, and a (company,title) key threw away 57 of 728 postings.
     seen, uniq = set(), []
     for j in hits:
-        key = (j["company"].lower().strip(), j["title"].lower().strip())
+        key = (j["company"].lower().strip(), j["title"].lower().strip(),
+               j["location"].lower().strip())
         if key not in seen:
             seen.add(key)
             uniq.append(j)
+    collapsed = len(hits) - len(uniq)
     uniq.sort(key=lambda j: (j["source"], j["company"], j["title"]))
 
     for j in uniq:
         j["description"] = j["description"][:4000]
     json.dump(uniq, open(a.out + ".json", "w"), indent=1)
     open(a.out + ".html", "w").write(render_html(uniq, kws, locs, dead))
-    print(f"\n{len(uniq)} jobs (from {len(jobs)} fetched) -> {a.out}.json / {a.out}.html", file=sys.stderr)
+    print(f"\n{len(uniq)} jobs (from {len(jobs)} fetched, {collapsed} exact duplicates "
+          f"collapsed) -> {a.out}.json / {a.out}.html", file=sys.stderr)
+    if not uniq:
+        print("\nNo match. Widen with fewer -k terms, drop -l, or check -x is not "
+              "eating results. Lever/Ashby/Greenhouse cover only companies.txt.", file=sys.stderr)
     if dead:
         print("dead sources:\n  " + "\n  ".join(dead), file=sys.stderr)
     if a.open:
@@ -237,6 +283,76 @@ function flt(btn,s){{
 function cp(i){{const j=D[i];navigator.clipboard.writeText(`${{j.title}} at ${{j.company}} (${{j.location}})\\n${{j.url}}`);
 event.target.textContent='copied';setTimeout(()=>event.target.textContent='copy for /apply',1200);}}
 </script>"""
+
+# ---------------------------------------------------------------- companies
+
+SLUG_IN_URL = re.compile(
+    r"(?:jobs\.lever\.co|jobs\.ashbyhq\.com|(?:boards|job-boards)\.greenhouse\.io)"
+    r"/(?:embed/job_board\?for=)?([A-Za-z0-9_-]+)")
+
+
+def slug_candidates(text):
+    """'Scale AI' -> scaleai, scale-ai, scale. A careers URL -> its real slug."""
+    m = SLUG_IN_URL.search(text)
+    if m:
+        return [m.group(1).lower()]
+    base = re.sub(r"[^a-z0-9 ]", "", text.lower()).split()
+    if not base:
+        return []
+    out = ["".join(base), "-".join(base), base[0]]
+    return list(dict.fromkeys(out))
+
+
+def resolve_company(name):
+    """Probe every ATS for every candidate slug. Returns the hits, verified by
+    an actual posting count. There is no directory API for this - probing is it."""
+    hits = []
+    for slug in slug_candidates(name):
+        for ats, fn in ATS.items():
+            try:
+                n = len(fn(slug))
+            except Exception:
+                continue
+            hits.append({"ats": ats, "slug": slug, "postings": n})
+    return hits
+
+
+def cmd_companies(a):
+    existing = set()
+    if os.path.exists(a.companies):
+        existing = {f"{x}:{y}" for x, y in load_companies(a.companies)[0]}
+
+    found, missing = [], []
+    for name in a.names:
+        hits = resolve_company(name)
+        live = [h for h in hits if h["postings"] > 0]
+        if not live:
+            missing.append(name)
+            tried = ", ".join(slug_candidates(name)) or "(no candidate slug)"
+            print(f"  ?  {name}: no board found (tried {tried})", file=sys.stderr)
+            continue
+        if len(live) > 1:
+            print(f"  !  {name} is ambiguous, {len(live)} boards match:", file=sys.stderr)
+        for h in live:
+            line = f"{h['ats']}:{h['slug']}"
+            mark = "already present" if line in existing else "NEW"
+            print(f"  ok {name}: {line}  ({h['postings']} postings, {mark})", file=sys.stderr)
+            if line not in existing:
+                found.append(line)
+                existing.add(line)
+
+    if found and a.add:
+        with open(a.companies, "a") as f:
+            f.write("\n".join(found) + "\n")
+        print(f"\nappended {len(found)} line(s) to {a.companies}", file=sys.stderr)
+    elif found:
+        print("\nadd these with --add, or paste into companies.txt:\n" + "\n".join(found))
+    if missing:
+        print(f"\nunresolved: {', '.join(missing)}\n"
+              "Open the employer's careers page; if the URL is not jobs.lever.co, "
+              "jobs.ashbyhq.com or boards.greenhouse.io, this tool cannot reach it.",
+              file=sys.stderr)
+
 
 # ---------------------------------------------------------------- dork
 
@@ -540,6 +656,12 @@ def main():
     p.add_argument("--role")
     p.add_argument("-o", "--out", default="INTERVIEW_PREP.md")
     p.set_defaults(fn=cmd_prep)
+
+    cm = sub.add_parser("companies", help="resolve company names/URLs to <ats>:<slug>")
+    cm.add_argument("names", nargs="+", help="company name or careers URL")
+    cm.add_argument("--add", action="store_true", help="append new hits to companies.txt")
+    cm.add_argument("--companies", default=os.path.join(HERE, "companies.txt"))
+    cm.set_defaults(fn=cmd_companies)
 
     a = ap.parse_args()
     a.fn(a)

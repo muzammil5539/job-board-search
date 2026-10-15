@@ -1,28 +1,328 @@
 ---
 name: job-board-search
 description: >
-  Search Lever, Ashby, Greenhouse, WorkingNomads and RemoteOK for jobs, list them in a
-  filterable HTML UI in Chrome, ATS-score a resume against a job description, generate a
-  copy/paste form-answer sheet, and build an interview prep sheet. Use for: search jobs,
-  find jobs, job board, remote jobs, lever, ashby, greenhouse, workingnomads, remoteok,
-  google dork jobs, ATS score, score my resume, resume keywords, form answers, what do I
-  put in this field, interview prep, screenshot the job list.
+  Find and shortlist job openings, then prepare the application. Searches Lever, Ashby,
+  Greenhouse, WorkingNomads and RemoteOK for roles by title, seniority, stack or location
+  (backend, frontend, fullstack, AI/ML, data, DevOps, product; remote, Europe, US, APAC,
+  worldwide), renders them as a filterable HTML list, resolves a company name or careers
+  URL to its job board, builds Google site: queries for boards it cannot call, scores a
+  resume against a job description for ATS keyword coverage, generates a copy/paste
+  application-form answer sheet, and drafts an interview prep sheet. Use when asked to
+  find/search/list jobs or openings, check which board a company uses, score or tailor a
+  resume for a posting, or prep for an interview. Does NOT search LinkedIn, Indeed,
+  Glassdoor or FlexJobs, does not submit applications, and cannot filter by funding stage,
+  company size or salary.
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion
 ---
 
 # job-board-search
 
-One driver — `jobs.py` — with five subcommands. No dev server, no framework.
-It hits each board's **public JSON API** rather than scraping rendered pages, so it is
-fast and does not break on CSS changes. Chrome is used for *viewing* (the HTML UI and
-Google dork queries), not for scraping.
+One driver, `jobs.py`, with six subcommands arranged as a pipeline. Boards are reached
+through their **public JSON APIs**, not by scraping rendered pages. Chrome is used for
+*viewing* — the HTML result list and Google queries — never for fetching.
 
-Paths below are relative to `~/Desktop/Job Application/`. The driver lives at
-`.claude/skills/job-board-search/jobs.py`.
+Paths are relative to the repo root. Run `python3 jobs.py --help` for the full flag list.
+
+**Deeper reference:** [output schema](references/output-schema.md) ·
+[board coverage and limits](references/boards.md) ·
+[how the ATS score works](references/ats-scoring.md)
+
+---
+
+## Phase 0 — Resolve companies
+
+**Goal** Turn a company name or careers URL into an `<ats>:<slug>` line.
+**Input** One or more names or URLs.
+**When** Before Phase 1, whenever the user names an employer not already in `companies.txt`.
+
+Lever, Ashby and Greenhouse have **no global search** — coverage is exactly what
+`companies.txt` lists. Grow it first.
+
+```bash
+python3 jobs.py companies "Ramp" "Scale AI" "https://boards.greenhouse.io/airbnb"
+```
+
+```
+  ok Ramp: ashby:ramp  (164 postings, already present)
+  ok Scale AI: greenhouse:scaleai  (179 postings, NEW)
+  ok https://boards.greenhouse.io/airbnb: greenhouse:airbnb  (163 postings, already present)
+```
+
+Add `--add` to append new hits to `companies.txt`. It probes every candidate slug against
+all three ATSes and verifies by posting count, so a reported hit is a live board.
+
+**Output** Printed `<ats>:<slug>` lines; appended to `companies.txt` with `--add`.
+
+**Failure modes**
+- *No board found* — the employer is not on these three ATSes. The tool names the slugs
+  it tried. Open their careers page; if the URL is not `jobs.lever.co`,
+  `jobs.ashbyhq.com` or `boards.greenhouse.io`, this tool cannot reach it. Go to Phase 2.
+- *Ambiguous: several boards match* — all are printed with posting counts. Pick by count;
+  near-zero is usually a stale board.
+- *Resolves but 0 postings* — the board exists and is empty (`ashby:deel` behaves this
+  way). Not an error, not worth adding.
+
+---
+
+## Phase 1 — Search
+
+**Goal** A deduplicated, filtered job list on disk.
+**Input** Keywords, locations, exclusions.
+
+```bash
+python3 jobs.py search \
+  -k "AI,Machine Learning,LLM,Backend,Fullstack,Full Stack,Python,Forward Deployed" \
+  -l "remote,anywhere,worldwide" \
+  -x "Director,Account Executive,Sales,Recruiter" \
+  --open
+```
+
+```
+73 jobs (from 3,296 fetched, 0 exact duplicates collapsed) -> jobs.json / jobs.html
+```
+
+| Flag | Effect |
+|---|---|
+| `-k` | Keywords, OR-matched against title + company + description |
+| `-l` | Locations, OR-matched against location + title |
+| `-x` | Exclusions; drops any job containing the term |
+| `--only` | Limit sources: `lever ashby greenhouse workingnomads remoteok` |
+| `-o` | Output basename (default `jobs`) |
+| `--open` | Open `jobs.html` in Chrome |
+
+All three match on **whole words**: `-k "AI"` does not hit *available* or *training*.
+Without that the same run returned 288 jobs instead of 73.
+
+**Output** `jobs.json` + a self-contained `jobs.html` — see
+[output-schema.md](references/output-schema.md). The HTML has a live text filter,
+per-source chips, collapsible descriptions and a copy button per job.
+
+**Failure modes**
+- *No results* — the run says so and suggests widening. Drop `-l` first (it is the
+  strictest filter), then shorten `-k`, then check `-x` is not eating matches.
+- *Too many results* — add `-x` terms for the noise you see, or narrow `-l`. The HTML
+  filter box is faster than re-running for exploratory narrowing.
+- *Unknown `--only` value* — exits with the valid list. It no longer returns a silent
+  `0 jobs`, which was indistinguishable from a genuine no-match.
+- *Malformed `companies.txt`* — bad lines print as `WARN <file>:<line>` and are skipped;
+  the run continues on the valid ones.
+- *`dead sources:` at the end* — those slugs 404'd. Prune them from `companies.txt`.
+- *Rate limited* — `_get` retries 3× with backoff on 429/502/503/504. A source that still
+  fails is listed as dead; re-run it alone with `--only`.
+
+---
+
+## Phase 2 — Reach boards the APIs cannot
+
+**Goal** Google queries for sources with no usable API.
+**Input** The same keywords and locations as Phase 1.
+
+```bash
+python3 jobs.py dork \
+  -k "AI,Forward Deployed,Backend,Frontend,Fullstack" \
+  -l "Remote,Anywhere" -e "after:2026-10-01" --open
+```
+
+```
+site:workingnomads.com/jobs ("AI" OR "Forward Deployed" OR "Backend") ("Remote" OR "Anywhere") after:2026-10-01
+```
+
+`--open` opens each query in Chrome. `-e` appends raw query text (`after:`, `intitle:`,
+`-intern`).
+
+**Output** One query + URL per board, printed. Nothing is fetched — you read the results.
+
+**Failure mode** Google may serve a CAPTCHA on rapid repeat queries. Space them out;
+never attempt to solve one programmatically.
+
+---
+
+## Phase 3 — Score the resume
+
+**Goal** A keyword-coverage and parseability read on one resume against one posting.
+**Input** A resume (`.pdf`/`.md`/`.txt`) and a JD in a text file.
+
+```bash
+python3 -c "
+import json;d=json.load(open('jobs.json'))
+j=[x for x in d if 'engineer' in x['title'].lower() and len(x['description'])>800][0]
+open('jd.txt','w').write(j['title']+'\n'+j['company']+'\n'+j['description'])"
+
+python3 jobs.py score resume.pdf jd.txt --json-out score.json
+```
+
+```
+ATS SCORE  45/100   needs work
+
+  keyword coverage    32  ██████··············  (13/40 JD terms present)
+  quantified impact   14  ██··················  (2/14 bullets carry a number)
+  parseability       100  ████████████████████
+```
+
+Weighted 55% keyword coverage, 20% quantified impact, 25% parseability, then it lists
+missing JD terms and parse flags. Full rubric: [ats-scoring.md](references/ats-scoring.md).
+
+**Output** The report, plus `score.json` with keys
+`total, keyword, quantified, parse, missing, matched, flags`.
+
+**This is a heuristic, not Google's ATS.** Google publishes no scorer. Use it to compare
+two drafts of the same resume, not as a verdict. Add missing terms **only where truthful** —
+the scorer cannot tell a real skill from a planted one; you can.
+
+**Failure modes**
+- *Score near 0 with a clean-looking PDF* — image-only scan, no text layer. Check with
+  `pdftotext resume.pdf - | wc -w`.
+- *`pdftotext: not found`* — `sudo apt-get install -y poppler-utils`.
+
+---
+
+## Phase 4 — Generate form answers
+
+**Goal** A copy/paste sheet for portal fields.
+**Input** A profile YAML with `identity`, `status`, `workAuthorization`, `compensation`,
+`constraints`, `languages`, `yearsOfExperience`, `references`.
+
+```bash
+python3 jobs.py answers profile.yaml -o FORM_ANSWERS.md
+```
+
+**Output** `FORM_ANSWERS.md`: identity table, ~25 screener Q&As (work authorisation,
+sponsorship, salary in both currencies, years of experience, self-identification,
+languages), references, non-compete window, skip rules, upload slots.
+
+**Every value is read from the YAML — nothing is invented.** Absent fields are omitted,
+never guessed. Edit the YAML and re-run; never hand-edit the output.
+
+The sheet ends with a **Never auto-fill** list: national ID numbers, CAPTCHAs, live video,
+and any screener answer that is not true. Those stay manual, always.
+
+**Failure mode** *Near-empty output* — the YAML uses different top-level key names. The
+expected keys are listed above.
+
+---
+
+## Phase 5 — Interview prep
+
+**Goal** A question scaffold for one posting.
+
+```bash
+python3 jobs.py prep jd.txt --role "Sr. Forward Deployed Engineer @ Databricks" -o INTERVIEW_PREP.md
+```
+
+```
+wrote INTERVIEW_PREP.md (1 tech, 6 domain)
+```
+
+Splits JD terms into **technical** (matched against a ~90-word vocabulary) and **domain**,
+asks a differently-shaped question for each, then five blank STAR frames and four
+questions to ask them.
+
+**Output** `INTERVIEW_PREP.md`. The `(1 tech, 6 domain)` count is itself a signal — a JD
+light on tech terms is likely a light technical interview.
+
+**Failure mode** *No recognised tech terms* — says so in the file rather than inventing
+questions. Read the posting and add your own.
+
+---
+
+## Worked examples
+
+### "Find me remote backend and AI roles I can actually apply to"
+
+```bash
+python3 jobs.py search -k "Backend,AI,Machine Learning,Python" \
+  -l "remote,anywhere,worldwide" -x "Director,Sales,Recruiter" --open
+```
+→ `73 jobs (from 3,296 fetched, 0 exact duplicates collapsed)`, opened in Chrome.
+
+### "Does Scale AI use Greenhouse? Add them and search."
+
+```bash
+python3 jobs.py companies "Scale AI" --add
+python3 jobs.py search --only greenhouse -k "AI,ML,Backend" -l remote
+```
+→ `ok Scale AI: greenhouse:scaleai (179 postings, NEW)`, appended, then searched.
+
+### "Search job boards for backend roles in Europe"
+
+```bash
+python3 jobs.py search -k "Backend,Platform,Infrastructure" \
+  -l "Europe,EU,Berlin,Amsterdam,London,Dublin,Remote Europe"
+python3 jobs.py dork -k "Backend" -l "Europe,Remote Europe"
+```
+Location is free-text matching, so **name the cities** — there is no geocoding. Run
+`dork` too: WorkingNomads and RemoteOK skew heavily US.
+
+### "Get me 20 recent data engineer jobs from LinkedIn and Indeed"
+
+Not supported. LinkedIn and Indeed have no public jobs API and scraping them breaches
+their terms. Do this instead:
+
+```bash
+python3 jobs.py search -k "Data Engineer,Analytics Engineer,ETL" -l remote
+python3 jobs.py dork -k "Data Engineer" -l "Remote" -e "after:2026-10-01"
+```
+The `dork` output includes a Google query you open in Chrome and read yourself.
+
+### "Score my CV for this posting and tell me what to fix"
+
+```bash
+python3 jobs.py score resume.pdf jd.txt --json-out score.json
+```
+→ `45/100` — keyword 32, quantified 14, parse 100. The actionable finding is usually
+`quantified`: bullets carrying no number. Fix that before chasing keywords.
+
+---
+
+## Limitations / out of scope
+
+**Cannot search:** LinkedIn, Indeed, Glassdoor, FlexJobs, Otta, Wellfound. No public API,
+or scraping breaches their terms. `dork` gives you a manual Google query instead.
+
+**Cannot filter by** funding stage ("Series B"), company size, industry, salary band, or
+visa-sponsorship status. None of the five APIs expose these. A request like *"jobs at
+Series B startups"* needs a funding dataset this tool does not have — resolve the
+companies yourself with Phase 0, then search.
+
+**No global ATS search.** Lever/Ashby/Greenhouse coverage equals `companies.txt`. The
+current list is 11 companies. This is the single biggest limit on recall.
+
+**No pagination.** RemoteOK caps at 99 results. Treat it as a sample of recent listings.
+
+**Does not submit applications.** It finds postings, scores resumes and prints answers.
+Filling and submitting forms stays with a human.
+
+**Never:** solve a CAPTCHA, fabricate a screener answer, or invent a job that was not
+returned by a board. Every job in `jobs.json` came from a real API response and carries
+its source URL.
+
+---
+
+## Gotchas
+
+- **Substring keyword matching is a trap.** `-k "AI"` matched *available*, *training* and
+  *retail*, returning 288 jobs where 70 were real — including "Account Director". Matching
+  now uses `(?<![a-z0-9])term(?![a-z0-9])`. Keep the boundaries or precision collapses.
+- **Dedup includes location on purpose.** A `(company, title)` key dropped 57 of Stripe's
+  728 postings, including one title listed separately in `US-CA` and `Singapore`.
+- **Slugs rot.** `lever:voiceflow` and `greenhouse:doordash` both 404'd within weeks. The
+  run reports them under `dead sources:`.
+- **`ashby:deel` returns 0 postings, not an error.** A zero is not necessarily a bug.
+- **Lever dates are epoch milliseconds**, RemoteOK's epoch seconds, the rest ISO.
+  `fmt_date()` sniffs by magnitude (`> 1e11` means ms). Raw ints rendered as
+  `1791484410` before this was handled.
+- **A pipe-separated contact line is not a table.** The parse check flagged
+  `phone | email | github | linkedin` and docked 15 points off a clean resume. It now
+  needs 3+ pipe rows.
+- **`pdftotext` runs without `-layout`** on purpose — `-layout` preserves columns with
+  tabs, tripping the very table check you want meaningful.
+- **Chrome hands off to a running instance.** `google-chrome <url>` opens a tab in your
+  existing Chrome and exits, so the URL never appears in `ps`. A clean exit is the only
+  confirmation; look at your browser.
+
+---
 
 ## Prerequisites
-
-Everything needed is already on this machine. Verified present:
 
 ```bash
 python3 -c "import requests, yaml" && which pdftotext google-chrome
@@ -34,180 +334,27 @@ If `pdftotext` is missing (needed only for `score` on a PDF):
 sudo apt-get install -y poppler-utils
 ```
 
-## Run: search a board set
+## Tests
 
 ```bash
-cd ~/Desktop/Job\ Application
-python3 .claude/skills/job-board-search/jobs.py search \
-  -k "AI,Machine Learning,LLM,Backend,Fullstack,Full Stack,Python,Forward Deployed" \
-  -l "remote,anywhere,worldwide" \
-  -x "Director,Account Executive,Sales,Recruiter" \
-  --open
+python3 tests/test_jobs.py
 ```
 
-Writes `jobs.json` + `jobs.html` and opens the HTML in Chrome. Last verified run:
-**70 jobs kept from 3,298 fetched**, no dead sources.
-
-- `-k` keywords, OR-matched against title + company + description
-- `-l` locations, OR-matched against location + title
-- `-x` exclusions, drops any job containing the term
-- `--only lever ashby greenhouse workingnomads remoteok` limits sources
-- `-o NAME` changes the output basename (default `jobs`)
-
-All three flags match on **whole words**, so `-k "AI"` does not hit *available* or
-*training*. Without that, a run returns ~4x the junk — see Gotchas.
-
-The HTML UI has a live text filter, per-source chips, collapsible descriptions and a
-**copy for /apply** button per job. It is a single self-contained file: light/dark aware,
-no network calls, safe to email or keep.
-
-### Adding companies
-
-Lever, Ashby and Greenhouse are **per-company** boards — there is no global search.
-`companies.txt` holds the slugs:
-
-```bash
-cat .claude/skills/job-board-search/companies.txt
-```
-
-Add one line per company, `<ats>:<slug>`. The slug is the last path segment of a careers
-URL: `jobs.lever.co/<slug>`, `jobs.ashbyhq.com/<slug>`, `boards.greenhouse.io/<slug>`.
-Dead slugs are **skipped and listed** at the end of the run, not fatal — prune them then.
-
-## Run: Google dork queries
-
-For boards whose API you cannot hit, or to catch postings the APIs miss:
-
-```bash
-python3 .claude/skills/job-board-search/jobs.py dork \
-  -k "AI,Forward Deployed,Backend,Frontend,Fullstack" \
-  -l "Remote,Anywhere" -e "after:2026-10-01" --open
-```
-
-Prints one query + Google URL per board, e.g.
-
-```
-site:workingnomads.com/jobs ("AI" OR "Forward Deployed" OR "Backend") ("Remote" OR "Anywhere") after:2026-10-01
-```
-
-`--open` opens each in Chrome. `-e` appends raw query text (`after:`, `intitle:`, `-intern`).
-
-## Run: ATS-score a resume
-
-```bash
-python3 .claude/skills/job-board-search/jobs.py score \
-  resume.pdf jd.txt --json-out score.json
-```
-
-Both arguments accept `.pdf`, `.md` or `.txt`. Save the JD by pasting the posting into a
-text file, or pull one out of a search run:
-
-```bash
-python3 -c "
-import json;d=json.load(open('jobs.json'))
-j=[x for x in d if 'engineer' in x['title'].lower() and len(x['description'])>800][0]
-open('jd.txt','w').write(j['title']+'\n'+j['company']+'\n'+j['description'])"
-```
-
-Output is a 0-100 score over three weighted bands:
-
-| Band | Weight | What it measures |
-|---|---|---|
-| keyword coverage | 55% | share of the JD's top-N terms present in the resume |
-| quantified impact | 20% | share of bullets carrying a number, %, or $ |
-| parseability | 25% | tables/tabs, length, standard headers, contact block |
-
-It then lists **missing JD terms** and **parseability flags**. Feed the missing terms into
-the tailoring step — but only where they are *truthful*. The scorer cannot tell a real
-skill from a planted keyword; you can.
-
-**This is a documented heuristic, not Google's actual ATS.** Google does not publish a
-scorer and no tool can reproduce one. Treat the number as a relative signal between two
-drafts of the same resume, not an absolute verdict. Verified behaviour: the same resume
-scored **38** against a manager JD and **45** against a matching IC JD — the gap is the
-useful part.
-
-## Run: form-answer sheet
-
-```bash
-python3 .claude/skills/job-board-search/jobs.py answers \
-  data/professional-profile.yaml -o FORM_ANSWERS.md
-```
-
-Renders every field from `data/professional-profile.yaml` into a copy/paste markdown
-sheet: identity table, ~25 screener Q&As (work authorisation, sponsorship, salary in both
-currencies, years of experience, self-identification, languages), references, any
-non-compete window, skip rules, and the upload slots.
-
-**Every value is read from the YAML — nothing is invented.** Absent fields are omitted,
-never guessed. To change an answer, edit the YAML and re-run; never hand-edit the output,
-it is regenerated.
-
-The sheet ends with a **Never auto-fill** list: CNIC, CAPTCHAs, live video, and any
-screener answer that is not true. Those stay manual, always.
-
-## Run: interview prep sheet
-
-```bash
-python3 .claude/skills/job-board-search/jobs.py prep jd2.txt \
-  --role "Sr. Forward Deployed Engineer @ Databricks" -o INTERVIEW_PREP.md
-```
-
-Splits the JD's terms into **technical** (matched against a ~90-word tech vocabulary) and
-**domain**, asks a differently-shaped question for each, then lays out five blank STAR
-frames and four questions to ask them. It prints how many of each it found — `(1 tech,
-6 domain)` means the JD was light on tech, which is itself a signal about the interview.
-
-For the STAR content and the full prep framework, use the existing
-`~/.claude/skills/job-application-assistant/07-interview-prep.md`. This subcommand builds
-the *scaffold*; that file holds the material.
-
-## Gotchas
-
-- **Substring keyword matching is a trap.** `-k "AI"` matched *available*, *training* and
-  *retail*, returning 288 jobs where 70 were real — including "Account Director". The
-  driver now uses `(?<![a-z0-9])term(?![a-z0-9])`. If you add matching logic, keep the
-  boundaries or precision collapses.
-- **Lever/Ashby/Greenhouse have no global search.** They are per-company only. Coverage
-  equals `companies.txt`. Treat `dork` as the discovery path and the API search as the
-  monitoring path for companies you already care about.
-- **Slugs rot.** `lever:voiceflow` and `greenhouse:doordash` both 404'd on the seed list
-  and were removed. Expect this every few months; the run reports them.
-- **`ashby:deel` returns 0 postings, not an error.** The board exists but serves nothing
-  through the public GraphQL endpoint. A zero is not necessarily a bug.
-- **Lever dates are epoch milliseconds**, RemoteOK's are epoch seconds, the rest are ISO.
-  `fmt_date()` sniffs by magnitude (`> 1e11` means ms). Raw ints rendered as
-  `1791484410` in the UI before this was handled.
-- **A pipe-separated contact line is not a table.** The parseability check flagged
-  `phone | email | github | linkedin` as a table layout and docked 15 points off a clean
-  resume. It now needs 3+ pipe rows before flagging.
-- **`pdftotext` runs without `-layout`** on purpose. `-layout` preserves columns with tabs,
-  which then trip the very table check you want to be meaningful.
-- **Chrome hands off to a running instance.** `google-chrome <url>` opens a tab in your
-  existing Chrome and exits immediately, so the URL never appears in `ps`. A clean exit is
-  the only confirmation available; look at your browser.
-- **FlexJobs is not supported.** It returns `000` to scripted clients and its listings sit
-  behind a paid subscription. `remoteworkjobs.com` is a parked domain that redirects to
-  `/lander` — RemoteOK is the working equivalent and is wired in instead.
-- **RemoteOK's API terms ask for a link back** if you republish their listings. Fine for
-  personal search; relevant if this output ever becomes a public page.
+23 offline tests, no network: whole-word matching, dedup keying, date sniffing,
+`companies.txt` parsing, slug candidates, term extraction, and the three scoring bands.
+Also runs under `python3 -m pytest tests/ -q`.
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| `HTTPError 404 ... api.lever.co/v0/postings/<slug>` | Dead or wrong slug. Open `jobs.lever.co/<slug>` in Chrome; if it 404s there too, delete the line from `companies.txt`. |
-| `ValueError: no board` from Ashby | Same thing for Ashby — the org name in the URL is the slug, not the display name. |
-| `search` returns far more than expected | A short keyword is substring-matching. Confirm you are on the boundary-matching build: `grep -n "(?<!\[a-z0-9\])" jobs.py` should hit `_rx`. |
-| `score` crashes on a PDF | `pdftotext` missing → `sudo apt-get install -y poppler-utils`. On an image-only scan it returns empty text and the score is meaningless; export a text PDF. |
-| `answers` writes a near-empty file | The YAML key names changed. It targets `identity`, `status`, `workAuthorization`, `compensation`, `constraints`, `languages`, `yearsOfExperience`, `references`. |
-| `--open` does nothing visible | Chrome opened a background tab in an existing window, or `google-chrome` is not on PATH. Open `jobs.html` by hand to confirm the file is good. |
-| Browser pane cannot screenshot `jobs.html` | It refuses `file://`. Serve it: `python3 -m http.server 8891` in the output directory, then load `http://localhost:8891/jobs.html`. |
-
-## What this does not do
-
-It does **not** submit applications. Filling and submitting portal forms stays with
-`job-application-assistant` and `job-swarm`, which already hold the hard rules
-(no CAPTCHA solving, no fabricated screener answers, the correct home city, tailored
-resume per application). This skill feeds those: it finds the posting, scores the resume,
-and prints the answers to paste.
+| `unknown source(s): linkedin` | `--only` takes `lever ashby greenhouse workingnomads remoteok`. LinkedIn is not supported. |
+| `WARN companies.txt:2: unknown ATS 'levers'` | Typo. Format is `<ats>:<slug>`, one per line. |
+| `HTTPError 404 ... api.lever.co/v0/postings/<slug>` | Dead or wrong slug. Confirm with `python3 jobs.py companies "<Name>"`, then prune. |
+| `ValueError: no board` from Ashby | Same, for Ashby. The org name in the URL is the slug, not the display name. |
+| `search` returns far more than expected | A short keyword is substring-matching. Confirm you are on the boundary build: `grep -n "(?<!\[a-z0-9\])" jobs.py` hits `_rx`. |
+| `0 jobs` with a sane query | `-l` is the strictest filter — drop it first. Remember ATS coverage is only `companies.txt`. |
+| `score` crashes on a PDF | `pdftotext` missing → `sudo apt-get install -y poppler-utils`. |
+| `answers` writes a near-empty file | YAML key names differ. See Phase 4. |
+| `--open` does nothing visible | Chrome opened a background tab, or `google-chrome` is not on PATH. Open `jobs.html` by hand. |
+| Browser pane cannot screenshot `jobs.html` | It refuses `file://`. Serve it: `python3 -m http.server 8891`, then `http://localhost:8891/jobs.html`. |

@@ -8,3 +8,5 @@ score.json
 jd*.txt
 *profile*.yaml
 __pycache__/
+__pycache__/
+.pytest_cache/

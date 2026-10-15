@@ -11,3 +11,4 @@ greenhouse:stripe
 greenhouse:airbnb
 greenhouse:databricks
 greenhouse:robinhood
+greenhouse:scaleai   # added via `jobs.py companies "Scale AI" --add`
