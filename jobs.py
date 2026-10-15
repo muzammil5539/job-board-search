@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Job board search + ATS scoring + form-answer sheet. One driver, six subcommands.
+"""Job board search + ATS scoring + form-answer sheet. One driver, seven subcommands.
 
-  companies resolve a company name or careers URL to an <ats>:<slug> board
+  companies resolve a company name or careers URL to an <ats>:<slug> board\n  scrape   search -> scrape postings via JSON-LD -> discover new boards
   search   fetch Lever/Ashby/Greenhouse/WorkingNomads/RemoteOK -> jobs.json + jobs.html
   dork     build Google site: queries per board, optionally open them in Chrome
   score    heuristic ATS score of a resume against a job description
@@ -109,6 +109,8 @@ def load_companies(path):
     """Returns (pairs, problems). A silently-dropped typo is indistinguishable
     from a company you forgot to add, so bad lines are returned, not swallowed."""
     out, problems = [], []
+    if not os.path.exists(path):
+        return out, [f"{path}: no such file (it will be created by --add)"]
     for n, raw in enumerate(open(path), 1):
         line = raw.split("#")[0].strip()
         if not line:
@@ -283,6 +285,133 @@ function flt(btn,s){{
 function cp(i){{const j=D[i];navigator.clipboard.writeText(`${{j.title}} at ${{j.company}} (${{j.location}})\\n${{j.url}}`);
 event.target.textContent='copied';setTimeout(()=>event.target.textContent='copy for /apply',1200);}}
 </script>"""
+
+# ---------------------------------------------------------------- scrape
+
+
+def merge_by_url(existing, incoming):
+    """Merge job rows, deduping on url. Existing rows win; order is stable."""
+    seen = {j.get("url") for j in existing if j.get("url")}
+    merged = list(existing)
+    added = 0
+    for j in incoming:
+        u = j.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        merged.append(j)
+        added += 1
+    return merged, added
+
+
+def cmd_scrape(a):
+    import scraper as S
+
+    # --- Step 1+2: gather candidate posting URLs -------------------------
+    urls, hits = [], []
+    if a.urls:
+        for line in open(a.urls):
+            u = line.strip()
+            if u.startswith("http"):
+                urls.append(u)
+        print(f"  {len(urls)} url(s) from {a.urls}", file=sys.stderr)
+
+    queries = S.build_queries(a.keywords or "", a.location or "", a.extra or "",
+                              sites=a.sites)[:a.max_queries]
+    if queries and not a.urls:
+        page = None
+        browser = None
+        if a.engine == "browser":
+            browser = S.open_browser(headless=a.headless,
+                                     profile_dir=S.open_browser.DEFAULT_PROFILE)
+            page = browser.__enter__()
+            if page is None:
+                sys.exit("browser engine unavailable; use --engine cse or --urls")
+        try:
+            for i, (name, q) in enumerate(queries):
+                if i:
+                    S._nap(S.QUERY_DELAY)
+                try:
+                    res = S.google_search(q, a.max_results, a.engine, page)
+                except Exception as e:
+                    print(f"  {name}: search failed: {str(e).splitlines()[0]}", file=sys.stderr)
+                    continue
+                print(f"  {name}: {len(res)} result(s)", file=sys.stderr)
+                hits += res
+                urls += [r["url"] for r in res if r.get("url")]
+        finally:
+            if browser is not None:
+                browser.__exit__()
+
+    urls = list(dict.fromkeys(urls))
+    if not urls:
+        sys.exit("\nNo posting URLs.\n"
+                 "  --engine auto found no credentials, or the engine returned nothing.\n"
+                 "  Options: set GOOGLE_CSE_KEY+GOOGLE_CSE_CX (--engine cse),\n"
+                 "           set BRAVE_API_KEY (--engine brave),\n"
+                 "           or collect URLs yourself and pass --urls urls.txt")
+
+    # --- Step 4: scrape each posting via JSON-LD (no browser needed) -----
+    rows = []
+    for i, u in enumerate(urls[:a.max_postings]):
+        if i:
+            S._nap(S.NAV_DELAY)
+        row = S.scrape_job_posting(u)
+        if row:
+            rows.append(row)
+    print(f"  scraped {len(rows)}/{min(len(urls), a.max_postings)} posting(s)", file=sys.stderr)
+
+    # --- Step 5: discover company slugs and verify them ------------------
+    discovered = {}
+    for u in urls:
+        ats, slug = S.detect_ats_from_url(u)
+        if ats in ATS and slug:
+            discovered.setdefault(f"{ats}:{slug}", (ats, slug))
+    known = {f"{x}:{y}" for x, y in load_companies(a.companies)[0]}
+    fresh, dead = [], []
+    for line, (ats, slug) in sorted(discovered.items()):
+        if line in known:
+            continue
+        try:
+            n = len(ATS[ats](slug))
+        except Exception:
+            dead.append(line)
+            continue
+        if n:
+            fresh.append((line, n))
+    for line, n in fresh:
+        print(f"  NEW {line} ({n} postings)", file=sys.stderr)
+    for line in dead:
+        print(f"  dead {line} (404 on its API)", file=sys.stderr)
+
+    if fresh and a.add:
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        with open(a.companies, "a") as f:
+            for line, n in fresh:
+                f.write(f"{line}   # discovered via scrape {stamp}\n")
+        print(f"  appended {len(fresh)} slug(s) to {a.companies}", file=sys.stderr)
+    elif fresh:
+        print("\nadd with --add, or paste into companies.txt:\n"
+              + "\n".join(l for l, _ in fresh))
+
+    # --- Step 6: store, and optionally merge ------------------------------
+    json.dump(rows, open(a.out + ".json", "w"), indent=1)
+    print(f"\n{len(rows)} job(s) -> {a.out}.json", file=sys.stderr)
+
+    if a.merge:
+        base = []
+        if os.path.exists(a.merge):
+            base = json.load(open(a.merge))
+        merged, added = merge_by_url(base, rows)
+        json.dump(merged, open(a.merge, "w"), indent=1)
+        print(f"  merged into {a.merge}: {added} new, {len(merged)} total", file=sys.stderr)
+        html_out = a.merge[:-5] + ".html" if a.merge.endswith(".json") else a.merge + ".html"
+        open(html_out, "w").write(render_html(merged, [], [], []))
+        print(f"  re-rendered {html_out}", file=sys.stderr)
+        if a.open:
+            subprocess.Popen(["google-chrome", os.path.abspath(html_out)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 # ---------------------------------------------------------------- companies
 
@@ -662,6 +791,26 @@ def main():
     cm.add_argument("--add", action="store_true", help="append new hits to companies.txt")
     cm.add_argument("--companies", default=os.path.join(HERE, "companies.txt"))
     cm.set_defaults(fn=cmd_companies)
+
+    sc = sub.add_parser("scrape", help="search -> scrape postings -> discover company boards")
+    sc.add_argument("-k", "--keywords", help="comma list, becomes an OR group in the query")
+    sc.add_argument("-l", "--location", help="comma list, becomes a second OR group")
+    sc.add_argument("-e", "--extra", help="raw extra query text, e.g. after:2026-10-01")
+    sc.add_argument("--engine", default="auto",
+                    choices=["auto", "cse", "brave", "browser", "manual"],
+                    help="search backend (default auto: cse -> brave -> manual)")
+    sc.add_argument("--urls", help="file of posting URLs, one per line; skips the search step")
+    sc.add_argument("--sites", nargs="*", help="limit queries to: lever ashby greenhouse workingnomads")
+    sc.add_argument("--max-queries", type=int, default=10, help="hard cap on search queries")
+    sc.add_argument("--max-results", type=int, default=30, help="results per query")
+    sc.add_argument("--max-postings", type=int, default=50, help="postings to fetch")
+    sc.add_argument("--headless", action="store_true", help="browser engine: hide the window")
+    sc.add_argument("--add", action="store_true", help="append discovered slugs to companies.txt")
+    sc.add_argument("--merge", help="merge results into this jobs.json and re-render its html")
+    sc.add_argument("--open", action="store_true", help="open the re-rendered html in Chrome")
+    sc.add_argument("--companies", default=os.path.join(HERE, "companies.txt"))
+    sc.add_argument("-o", "--out", default="scraped_jobs")
+    sc.set_defaults(fn=cmd_scrape)
 
     a = ap.parse_args()
     a.fn(a)

@@ -16,8 +16,8 @@ python3 jobs.py search -k "AI,Backend,Python" -l "remote,anywhere" --open
 ```bash
 git clone https://github.com/muzammil5539/job-board-search
 cd job-board-search
-pip install requests pyyaml          # PDF scoring also needs: apt-get install poppler-utils
-python3 tests/test_jobs.py           # 23 offline tests, no network
+pip install -r requirements.txt      # PDF scoring also needs: apt-get install poppler-utils
+python3 tests/test_jobs.py && python3 tests/test_scraper.py   # 54 offline tests, no network
 ```
 
 As a Claude Code skill, drop the directory into `.claude/skills/` in any project and ask
@@ -28,6 +28,7 @@ Claude to "find remote backend jobs" or "score my resume for this posting".
 | Command | Does |
 |---|---|
 | `companies` | Resolve a company name or careers URL to an `<ats>:<slug>` board |
+| `scrape` | Scrape postings via JSON-LD and discover new company boards from search results |
 | `search` | Fetch all boards, filter, write `jobs.json` + a self-contained `jobs.html` |
 | `dork` | Build `site:` Google queries per board, optionally open them in Chrome |
 | `score` | Heuristic ATS score of a resume against a job description |
@@ -59,6 +60,12 @@ Deeper reference:
   breaches their terms. `dork` gives you a manual Google query instead.
 - **Cannot filter** by funding stage, company size or salary. No API exposes them.
 - **RemoteOK caps at 99 results.** No pagination anywhere.
+- **Google SERP scraping does not work.** Verified: real Chrome 151 and bundled Chromium,
+  headless and visible, were both served a reCAPTCHA on query #1. `scrape` uses the Google
+  Programmable Search JSON API (`--engine cse`) or Brave instead; `--engine browser`
+  exists but hands a CAPTCHA back rather than defeating it.
+- **Playwright is optional.** Only `--engine browser` uses it, and it drives your
+  installed Chrome, so the 300MB Chromium download is not needed.
 - **The ATS score is a heuristic, not Google's.** Use it to compare two drafts of the same
   resume, not as a verdict.
 - **Does not submit applications.** Finding and preparing only.

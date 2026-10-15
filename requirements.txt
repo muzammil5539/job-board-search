@@ -1,0 +1,14 @@
+# Core - everything except the `browser` search engine runs on these.
+requests>=2.31
+PyYAML>=6.0
+
+# Optional, only for `scrape --engine browser`.
+# Installed on its own it drives your EXISTING Google Chrome (channel="chrome"),
+# so you do NOT need `playwright install chromium` (~300MB) unless you want the
+# bundled browser as well:
+#     pip install playwright
+# playwright>=1.40
+
+# System packages (not pip):
+#   poppler-utils   -> pdftotext, needed by `score` on a PDF
+#   google-chrome   -> --open, and the `browser` / `manual` engines

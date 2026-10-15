@@ -10,3 +10,6 @@ jd*.txt
 __pycache__/
 __pycache__/
 .pytest_cache/
+scraped_jobs.json
+captcha_debug.png
+urls.txt

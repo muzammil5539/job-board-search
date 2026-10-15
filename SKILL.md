@@ -5,10 +5,12 @@ description: >
   Greenhouse, WorkingNomads and RemoteOK for roles by title, seniority, stack or location
   (backend, frontend, fullstack, AI/ML, data, DevOps, product; remote, Europe, US, APAC,
   worldwide), renders them as a filterable HTML list, resolves a company name or careers
-  URL to its job board, builds Google site: queries for boards it cannot call, scores a
+  URL to its job board, scrapes job postings and discovers new company job boards from
+  search results, builds Google site: queries for boards it cannot call, scores a
   resume against a job description for ATS keyword coverage, generates a copy/paste
   application-form answer sheet, and drafts an interview prep sheet. Use when asked to
-  find/search/list jobs or openings, check which board a company uses, score or tailor a
+  find/search/list/scrape jobs or openings, discover or add company job boards, check which
+  board a company uses, open job tabs, score or tailor a
   resume for a posting, or prep for an interview. Does NOT search LinkedIn, Indeed,
   Glassdoor or FlexJobs, does not submit applications, and cannot filter by funding stage,
   company size or salary.
@@ -17,7 +19,7 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion
 
 # job-board-search
 
-One driver, `jobs.py`, with six subcommands arranged as a pipeline. Boards are reached
+One driver, `jobs.py`, with seven subcommands arranged as a pipeline. Boards are reached
 through their **public JSON APIs**, not by scraping rendered pages. Chrome is used for
 *viewing* — the HTML result list and Google queries — never for fetching.
 
@@ -134,6 +136,77 @@ site:workingnomads.com/jobs ("AI" OR "Forward Deployed" OR "Backend") ("Remote" 
 
 **Failure mode** Google may serve a CAPTCHA on rapid repeat queries. Space them out;
 never attempt to solve one programmatically.
+
+---
+
+## Phase 2b — Scrape postings and discover new boards
+
+**Goal** Turn search results into structured jobs **and** into new `companies.txt` slugs.
+**Input** Keywords, or a file of posting URLs.
+**Why** This is the only phase that grows ATS coverage automatically. Phase 0 needs you to
+name a company; this one finds companies you did not know to name.
+
+```bash
+python3 jobs.py scrape --urls urls.txt --merge jobs.json --add
+```
+
+```
+  7 url(s) from urls.txt
+  scraped 6/7 posting(s)
+  NEW ashby:linear (31 postings)
+  NEW greenhouse:scaleai (179 postings)
+  NEW lever:ro (55 postings)
+  appended 3 slug(s) to companies.txt
+6 job(s) -> scraped_jobs.json
+  merged into jobs.json: 6 new, 9 total
+  re-rendered jobs.html
+```
+
+Postings are read from **`JobPosting` JSON-LD** over plain HTTP — Lever, Ashby and
+employer-hosted Greenhouse all serve it without JavaScript, so no browser is involved.
+Greenhouse's own board pages are the exception (see Gotchas) and fall back to the
+Greenhouse job API.
+
+| Flag | Effect |
+|---|---|
+| `--urls FILE` | Posting URLs, one per line; skips the search step entirely |
+| `--engine` | `auto` (default), `cse`, `brave`, `browser`, `manual` |
+| `--add` | Append verified discovered slugs to `companies.txt`, date-stamped |
+| `--merge FILE` | Merge into that `jobs.json` (dedup by URL) and re-render its HTML |
+| `--max-queries` | Hard cap on search queries, default 10 |
+| `--max-postings` | Cap on postings fetched, default 50 |
+| `--sites` | Limit queries to `lever ashby greenhouse workingnomads` |
+
+### Choosing a search engine
+
+| Engine | Needs | Status |
+|---|---|---|
+| `cse` | `GOOGLE_CSE_KEY` + `GOOGLE_CSE_CX` | **Recommended.** Google's own Programmable Search JSON API, 100 queries/day free, never CAPTCHAs |
+| `brave` | `BRAVE_API_KEY` | Brave Search API, free tier available |
+| `browser` | `pip install playwright` | Drives your **installed Chrome** (`channel="chrome"`), persistent profile at `~/.cache/job-board-search/chrome-profile`. **Verified to hit a reCAPTCHA on query #1 from this network** |
+| `manual` | nothing | Opens each query in Chrome; you copy URLs into a file and use `--urls` |
+| `auto` | — | `cse` → `brave` → `manual`, by which credentials exist |
+
+Getting CSE credentials: create a Programmable Search Engine at
+`programmablesearchengine.google.com` (set it to search the whole web), then an API key
+at `console.cloud.google.com` with the Custom Search API enabled.
+
+**Output** `scraped_jobs.json` (same row schema as `jobs.json`, plus `salary`,
+`employment_type` and `apply_url`), new lines in `companies.txt`, optionally a merged
+`jobs.json` and re-rendered `jobs.html`.
+
+**Failure modes**
+- *No posting URLs* — the run exits naming all four ways to supply them. `auto` with no
+  credentials falls through to `manual`, which opens tabs and returns nothing to scrape.
+- *Google CAPTCHA on `--engine browser`* — a screenshot is written to `captcha_debug.png`
+  and the run stops. **This tool never solves CAPTCHAs.** Either solve it yourself in the
+  visible window (the persistent profile remembers it) or switch to `--engine cse`.
+- *`skip <url>: no JobPosting JSON-LD and no API fallback`* — that page carries no
+  structured data. Logged, skipped, the run continues.
+- *`dead <ats>:<slug> (404 on its API)`* — the URL looked like a board but the slug does
+  not resolve. Never added.
+- *Slug discovery still works when the posting scrape fails* — the two are independent, so
+  a page you could not parse can still contribute a company.
 
 ---
 
@@ -292,6 +365,22 @@ current list is 11 companies. This is the single biggest limit on recall.
 **Does not submit applications.** It finds postings, scores resumes and prints answers.
 Filling and submitting forms stays with a human.
 
+**Google SERP scraping does not work.** Verified: a Playwright-driven Chrome — headless
+*and* visible, bundled Chromium *and* your installed Chrome 151 — was served a reCAPTCHA
+image grid on **query #1**, not at some rate limit. A plain `requests` GET returns 200 and
+92KB with **zero** extractable result URLs. The working paths are the `cse` and `brave`
+APIs, or `manual`. Defeating the block would mean bot-detection evasion, which this tool
+does not do.
+
+**Playwright is optional and not recommended.** It is only used by `--engine browser`. It
+is a heavy dependency, and on the evidence above it buys nothing the CSE API does not do
+better. When installed it drives your existing Chrome, so the ~300MB Chromium download is
+not required.
+
+**Discovery needs a search engine.** Checked and ruled out: RemoteOK and WorkingNomads
+listings contain **0** outbound Lever/Ashby/Greenhouse links (they rewrite apply URLs), so
+new slugs cannot be harvested from the global boards for free.
+
 **Never:** solve a CAPTCHA, fabricate a screener answer, or invent a job that was not
 returned by a board. Every job in `jobs.json` came from a real API response and carries
 its source URL.
@@ -316,6 +405,14 @@ its source URL.
   needs 3+ pipe rows.
 - **`pdftotext` runs without `-layout`** on purpose — `-layout` preserves columns with
   tabs, tripping the very table check you want meaningful.
+- **Greenhouse's own board pages carry no JSON-LD.** `job-boards.greenhouse.io/<slug>/jobs/<id>`
+  renders client-side and has zero `ld+json`, while the *employer-hosted* version
+  (`stripe.com/jobs?gh_jid=...`) has a full `JobPosting`. Both the slug and job id are in
+  the URL, so `greenhouse_job_api()` calls the board API instead of rendering the page.
+  This took the end-to-end scrape from 4/7 postings to 6/7.
+- **A fresh browser profile is the CAPTCHA trigger, not the binary.** Real Chrome 151 was
+  blocked identically to bundled Chromium. The persistent profile exists so that a
+  consent screen or CAPTCHA you clear once is remembered.
 - **Chrome hands off to a running instance.** `google-chrome <url>` opens a tab in your
   existing Chrome and exits, so the URL never appears in `ps`. A clean exit is the only
   confirmation; look at your browser.
@@ -337,12 +434,15 @@ sudo apt-get install -y poppler-utils
 ## Tests
 
 ```bash
-python3 tests/test_jobs.py
+python3 tests/test_jobs.py && python3 tests/test_scraper.py
 ```
 
-23 offline tests, no network: whole-word matching, dedup keying, date sniffing,
+54 offline tests, no network and no browser. `test_jobs.py` (23): whole-word matching, dedup keying, date sniffing,
 `companies.txt` parsing, slug candidates, term extraction, and the three scoring bands.
-Also runs under `python3 -m pytest tests/ -q`.
+`test_scraper.py` (31): ATS URL detection for every board shape, JSON-LD extraction
+(nested `@graph`, `@type` lists, malformed blocks, salary ranges), SERP parsing, query
+building, WorkingNomads/Lever normalisation with mocked HTTP, URL-dedup merging, and the
+engine credential guards. Both run under `python3 -m pytest tests/ -q`.
 
 ## Troubleshooting
 
@@ -357,4 +457,8 @@ Also runs under `python3 -m pytest tests/ -q`.
 | `score` crashes on a PDF | `pdftotext` missing → `sudo apt-get install -y poppler-utils`. |
 | `answers` writes a near-empty file | YAML key names differ. See Phase 4. |
 | `--open` does nothing visible | Chrome opened a background tab, or `google-chrome` is not on PATH. Open `jobs.html` by hand. |
+| `scrape` exits "No posting URLs" | `auto` found no search credentials. Set `GOOGLE_CSE_KEY`+`GOOGLE_CSE_CX`, or collect URLs yourself and pass `--urls`. |
+| `Google served a CAPTCHA / block page` | Expected for `--engine browser`. See `captcha_debug.png`. Use `--engine cse`. |
+| `playwright not installed` | Only `--engine browser` needs it: `pip install playwright`. It will use your installed Chrome. |
+| `skip <url>: no JobPosting JSON-LD and no API fallback` | That page has no structured data. Normal; the run continues. |
 | Browser pane cannot screenshot `jobs.html` | It refuses `file://`. Serve it: `python3 -m http.server 8891`, then `http://localhost:8891/jobs.html`. |
